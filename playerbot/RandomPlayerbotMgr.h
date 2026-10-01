@@ -211,6 +211,7 @@ public:
             uint32 roleTank = 0, roleHeal = 0, roleDps = 0;
             uint32 active = 0, moving = 0, taxi = 0, mounted = 0, combat = 0, dead = 0, afk = 0;
             uint32 stuck = 0;
+            uint32 notInWorld = 0;                     // bots without a map (mid-teleport / logging out)
             std::map<uint8, uint32> perState;          // BotState -> count
             std::map<std::string, uint32> activity;    // idle / moving / traveling / combat
             std::map<uint32, uint32> perZone;          // zone id -> count
@@ -241,6 +242,8 @@ public:
         std::list<std::string> HandleConsoleCleanMap(std::string param);
         std::list<std::string> HandleConsoleLoginDebug(std::string param);
         std::list<std::string> HandleConsolePathCheck(std::string param);
+        std::list<std::string> HandleConsoleTaxTest(std::string param);
+        std::list<std::string> HandleConsoleZoneUpd(std::string param);
         // Override virtual methods from PlayerbotHolder
         virtual uint32 GetOrCreateAccount(Player* master, std::string& error) override;
         virtual void OnBotDeleted(uint32 botGuid, uint32 accountId) override;

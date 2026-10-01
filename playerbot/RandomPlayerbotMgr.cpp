@@ -21,6 +21,10 @@
 
 #include "BattleGround/BattleGround.h"
 #include "BattleGround/BattleGroundMgr.h"
+
+#ifdef GenerateBotTests
+#include "strategy/tests/TestRegistry.h"
+#endif
 #include "Chat/ChannelMgr.h"
 #include "Guilds/GuildMgr.h"
 #include "World/WorldState.h"
@@ -524,6 +528,20 @@ void RandomPlayerbotMgr::LogPlayerLocation()
 
                     sPlayerbotAIConfig.log("player_location.csv", out.str().c_str());
 
+                    if (sPlayerbotAIConfig.hasLog("bot_heartbeat.csv"))
+                    {
+                        std::ostringstream hb;
+                        hb << sPlayerbotAIConfig.GetTimestampStr() << "+00,";
+                        hb << bot->GetName() << ",";
+                        hb << bot->GetLevel() << ",";
+                        hb << bot->GetHealth() << ",";
+                        hb << bot->GetPowerPercent() << ",";
+                        hb << (bot->IsInCombat() ? "combat" : "non-combat") << ",";
+                        WorldPosition(bot).printWKT(hb);
+
+                        sPlayerbotAIConfig.log("bot_heartbeat.csv", hb.str().c_str());
+                    }
+
                     if (sPlayerbotAIConfig.hasLog("player_paths.csv") && WorldPosition(bot))
                     {
                         auto& botMoveLog = playerBotMoveLog[bot->GetObjectGuid().GetCounter()];
@@ -974,18 +992,16 @@ void RandomPlayerbotMgr::LoginFreeBots()
                     }
                 }
 
+#ifdef GenerateBotTests
                 if (GetEventValue(botGuid, "test"))
                 {
-                    PlayerbotAI* ai = bot->GetPlayerbotAI();
-                    AiObjectContext* context = ai->GetAiObjectContext();
                     std::string testName = GetEventData(botGuid, "test");
                     testName = std::regex_replace(testName, std::regex("\\'"), "'");
-                    std::string strategyName = "test::" + testName;
-                    ai->ChangeStrategy("+" + strategyName, BotState::BOT_STATE_NON_COMBAT);
-                    SET_AI_VALUE2(bool, "manual bool", "is running test", true);
+                    TestRegistry::StartTest(bot->GetPlayerbotAI(), testName);
 
                     sRandomPlayerbotMgr.SetValue(botGuid, "test", 0);
                 }
+#endif
 
                 if (!IsRandomBot(bot) && GetPlayerBot(guid)) //Place bot in player manager.
                 {
@@ -1004,7 +1020,20 @@ void RandomPlayerbotMgr::LoginFreeBots()
                 }
 
                 if (master)
-                    bot->TeleportTo(WorldPosition(master));
+                {
+                    // Only move the bot when it is genuinely not with its master. A freshly created bot is
+                    // saved at the master's position - CreateBot flags a pending teleport so SaveToDB()
+                    // persists that destination - so teleporting unconditionally here would be a second
+                    // movement to the spot the bot is already standing on. The gate also makes the
+                    // repeated per-pass teleport a no-op once the bot is in place, instead of re-issuing
+                    // it every pass.
+                    const bool sameMap = (bot->GetMapId() == master->GetMapId());
+                    const float masterDistance = sameMap ? bot->GetDistance(master) : -1.0f;
+                    if (!sameMap || masterDistance > INTERACTION_DISTANCE)
+                    {
+                        bot->TeleportTo(WorldPosition(master));
+                    }
+                }
 
                 BotAlwaysOnline always = BotAlwaysOnline(sRandomPlayerbotMgr.GetValue(botGuid, "always"));
                 if (always != BotAlwaysOnline::ACTIVE)
@@ -2178,6 +2207,30 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
 
     PlayerbotAI* ai = player ? player->GetPlayerbotAI() : NULL;
 
+#ifdef GenerateBotTests
+    if (player && ai)
+    {
+        // Suppress the roam lifecycle (logout / randomize / strategy churn / grind teleports) for
+        // scenario hosts AND their party members: a mid-run member logout leaves the group short a
+        // slot and trips the "group size" abort monitor with everyone still alive in the instance.
+        bool isTestProtected = false;
+        AiObjectContext* ctx = ai->GetAiObjectContext();
+        if (ctx && ctx->GetValue<bool>("manual bool", "is running test")->Get())
+            isTestProtected = true;
+        else if (Group* group = player->GetGroup())
+        {
+            Player* leader = sObjectMgr.GetPlayer(group->GetLeaderGuid());
+            PlayerbotAI* leaderAi = leader ? leader->GetPlayerbotAI() : NULL;
+            AiObjectContext* leaderCtx = leaderAi ? leaderAi->GetAiObjectContext() : NULL;
+            if (leaderCtx && leaderCtx->GetValue<bool>("manual bool", "is running test")->Get())
+                isTestProtected = true;
+        }
+
+        if (isTestProtected)
+            return false;
+    }
+#endif
+
     bool botsAllowedInWorld = !sPlayerbotAIConfig.randomBotLoginWithPlayer || (!players.empty() && sWorld.GetActiveSessionCount() > 0);
 
     bool isValid = true;
@@ -2450,8 +2503,9 @@ void RandomPlayerbotMgr::RandomTeleport(Player* bot, std::vector<WorldLocation> 
                         uint32 botsNearTeleportPoint = 0;
                         ForEachPlayerbot([&](Player* otherBot)
                         {
-                            // Only check the bots that are on the same zone
-                            if (otherBot && !otherBot->IsBeingTeleported() && zoneId == otherBot->GetZoneId())
+                            // Only check the bots that are on the same zone. IsInWorld() first:
+                            // GetZoneId() asserts m_currMap, and a bot being teleported has no map.
+                            if (otherBot && otherBot->IsInWorld() && !otherBot->IsBeingTeleported() && zoneId == otherBot->GetZoneId())
                             {
                                 if (l.fDist(WorldPosition(otherBot)) <= sPlayerbotAIConfig.randomBotTeleportNearPlayerMaxAmountRadius)
                                 {
@@ -3435,6 +3489,8 @@ bool RandomPlayerbotMgr::HandlePlayerbotConsoleCommand(ChatHandler* handler, cha
     handlers["history"] = &RandomPlayerbotMgr::HandleConsoleHistory;
     handlers["clean map"] = &RandomPlayerbotMgr::HandleConsoleCleanMap;
     handlers["login debug"] = &RandomPlayerbotMgr::HandleConsoleLoginDebug;
+    handlers["taxtest"] = &RandomPlayerbotMgr::HandleConsoleTaxTest;
+    handlers["zoneupd"] = &RandomPlayerbotMgr::HandleConsoleZoneUpd;
 
     for (auto& [prefix, consoleHandler] : handlers)
     {
@@ -3790,7 +3846,12 @@ RandomPlayerbotMgr::BotStats RandomPlayerbotMgr::GatherBotStats()
         if (GetBotStuck(bot))
             stats.stuck++;
 
-        stats.perZone[bot->GetZoneId()]++;
+        // Only in-world bots have a map. GetZoneId() -> GetTerrain() asserts m_currMap, so a bot that
+        // is mid-teleport / logging out aborts the whole process. Skip it (and count it separately).
+        if (bot->IsInWorld())
+            stats.perZone[bot->GetZoneId()]++;
+        else
+            stats.notInWorld++;
     });
 
     return stats;
@@ -3853,6 +3914,10 @@ std::list<std::string> RandomPlayerbotMgr::FormatBotStats(const BotStats& stats,
     }
 
     lines.push_back("  stuck:    " + std::to_string(stats.stuck));
+
+    // Bots counted in the total but excluded from the zone histogram because they have no map.
+    if (stats.notInWorld)
+        lines.push_back("  not in world: " + std::to_string(stats.notInWorld) + " (excluded from zone counts)");
 
     // Level bands
     {
@@ -4056,8 +4121,14 @@ std::string RandomPlayerbotMgr::FormatBotLine(Player* bot)
     AiObjectContext* context = ai->GetAiObjectContext();
 
     std::string zone = "unknown";
-    if (AreaTableEntry const* area = GetAreaEntryByAreaID(bot->GetZoneId()))
-        zone = area->area_name[0];
+
+    // GetZoneId() -> GetTerrain() asserts m_currMap. A bot that is mid-teleport or logging out has no
+    // map, and this runs for every bot over RA ('find'/'sample'), so guard before touching it.
+    if (bot->IsInWorld())
+    {
+        if (AreaTableEntry const* area = GetAreaEntryByAreaID(bot->GetZoneId()))
+            zone = area->area_name[0];
+    }
 
     std::string lastExecuted = ai->GetLastExecutedActionName(state);
     if (lastExecuted.empty()) lastExecuted = "none";
@@ -4264,6 +4335,78 @@ std::list<std::string> RandomPlayerbotMgr::HandleConsoleSample(std::string param
 std::list<std::string> RandomPlayerbotMgr::HandleConsoleFind(std::string param)
 {
     return SampleBots(param, true);
+}
+
+std::list<std::string> RandomPlayerbotMgr::HandleConsoleTaxTest(std::string param)
+{
+    std::list<std::string> messages;
+
+    std::vector<std::string> parts = Qualified::getMultiQualifiers(param, " ");
+    if (parts.size() < 2)
+    {
+        messages.push_back("usage: taxtest <bot> <node> [node...]");
+        return messages;
+    }
+
+    Player* bot = sObjectAccessor.FindPlayerByName(parts[0].c_str());
+    if (!bot || !bot->GetPlayerbotAI())
+    {
+        messages.push_back("taxtest: bot not found: " + parts[0]);
+        return messages;
+    }
+
+    std::vector<uint32> nodes;
+    for (size_t i = 1; i < parts.size(); ++i)
+        nodes.push_back(uint32(atoi(parts[i].c_str())));
+
+    TaxiNodesEntry const* start = sTaxiNodesStore.LookupEntry(nodes[0]);
+    if (!start)
+    {
+        messages.push_back("taxtest: bad start node");
+        return messages;
+    }
+
+    if (bot->GetMapId() != start->map_id)
+    {
+        bot->TeleportTo(start->map_id, start->x, start->y, start->z, bot->GetOrientation());
+        messages.push_back("taxtest: teleported to start map; rerun the command");
+        return messages;
+    }
+
+    bot->CombatStop(true);
+    bot->GetMotionMaster()->Clear();
+    bot->SetPosition(start->x, start->y, start->z, bot->GetOrientation(), true);
+
+    bool ok = bot->ActivateTaxiPathTo(nodes, nullptr, 0);
+    messages.push_back(std::string("taxtest ") + bot->GetName() + ": " + (ok ? "taxi started" : "ActivateTaxiPathTo FAILED"));
+    return messages;
+}
+
+std::list<std::string> RandomPlayerbotMgr::HandleConsoleZoneUpd(std::string param)
+{
+    std::list<std::string> messages;
+
+    std::vector<std::string> parts = Qualified::getMultiQualifiers(param, " ");
+    if (parts.size() < 2)
+    {
+        messages.push_back("usage: zoneupd <bot> <zone>");
+        return messages;
+    }
+
+    Player* bot = sObjectAccessor.FindPlayerByName(parts[0].c_str());
+    if (!bot || !bot->GetSession())
+    {
+        messages.push_back("zoneupd: bot not found: " + parts[0]);
+        return messages;
+    }
+
+    uint32 zone = uint32(atoi(parts[1].c_str()));
+    WorldPacket data(CMSG_ZONEUPDATE, 4);
+    data << zone;
+    bot->GetSession()->HandleZoneUpdateOpcode(data);
+
+    messages.push_back("zoneupd " + std::string(bot->GetName()) + ": sent CMSG_ZONEUPDATE " + std::to_string(zone));
+    return messages;
 }
 
 void RandomPlayerbotMgr::PrintStats(uint32 requesterGuid)
